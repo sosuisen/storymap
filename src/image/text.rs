@@ -2,10 +2,12 @@
 
 use comrak::nodes::NodeValue;
 use comrak::{Arena, Node, Options, parse_document};
-use resvg::usvg::{self, Tree};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use super::ImageOptions;
 use crate::escape::escape_markup;
+use resvg::usvg::fontdb::{Database, ID};
+use resvg::usvg::{self, FontResolver, Tree};
 
 // The image has one line per text, so a line break becomes a space
 fn one_line(text: &str) -> String {
@@ -275,7 +277,7 @@ fn collect_runs(node: Node<'_>, style: &Run, runs: &mut Vec<Run>) {
 }
 
 // The width of each text when it is drawn with the fonts
-pub(super) fn measure(texts: &[TextSpec], options: &ImageOptions) -> Vec<f32> {
+pub(super) fn measure(texts: &[TextSpec], usvg_options: &usvg::Options) -> Vec<f32> {
     let elements: String = texts
         .iter()
         .enumerate()
@@ -283,15 +285,52 @@ pub(super) fn measure(texts: &[TextSpec], options: &ImageOptions) -> Vec<f32> {
         .collect();
     let svg =
         format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1">{elements}</svg>"#);
-    let usvg_options = usvg::Options {
-        fontdb: options.fonts.clone(),
-        ..usvg::Options::default()
-    };
-    let tree = Tree::from_str(&svg, &usvg_options).expect("the measuring svg is well formed");
+    let tree = Tree::from_str(&svg, usvg_options).expect("the measuring svg is well formed");
     (0..texts.len())
         .map(|index| {
             tree.node_by_id(&format!("text-{index}"))
                 .map_or(0.0, |node| node.abs_bounding_box().width())
         })
         .collect()
+}
+
+/// The options for usvg to measure and draw the text with `fonts`.
+/// Use the same options for all the texts of one image, so that each fallback font is found only once
+pub(super) fn usvg_options(fonts: &Arc<Database>) -> usvg::Options<'static> {
+    usvg::Options {
+        fontdb: fonts.clone(),
+        font_resolver: FontResolver {
+            select_font: FontResolver::default_font_selector(),
+            select_fallback: remembered_fallback_selector(),
+        },
+        ..usvg::Options::default()
+    }
+}
+
+// A character and the fonts already tried for it, with the fallback font for them
+type FoundFallbacks = HashMap<(char, Vec<ID>), Option<ID>>;
+
+// usvg finds a fallback font by trying all the installed fonts in turn, which is slow with hundreds of fonts.
+// The wrapping measures the same characters again and again, so each answer is remembered.
+// The answer of the default selector is kept as it is, so the drawn fonts do not change
+fn remembered_fallback_selector() -> usvg::FallbackSelectionFn<'static> {
+    let select = FontResolver::default_fallback_selector();
+    let found: Mutex<FoundFallbacks> = Mutex::default();
+    Box::new(move |ch, used_fonts, fonts| {
+        let key = (ch, used_fonts.to_vec());
+        // A panic while the lock is held cannot leave a wrong answer in the map, so a poisoned lock is still usable
+        let known = found
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .copied();
+        known.unwrap_or_else(|| {
+            let answer = select(ch, used_fonts, fonts);
+            found
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key, answer);
+            answer
+        })
+    })
 }
