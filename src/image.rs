@@ -16,7 +16,7 @@ use crate::style::{
 };
 use crate::{Cell, StoryMap};
 use layout::{Flow, Grid};
-use text::{TextSpec, measure};
+use text::{TextSpec, measure, usvg_options};
 
 // The sizes follow the CSS of the HTML output, in CSS pixels
 const FONT_SIZE: f32 = 16.0;
@@ -129,13 +129,17 @@ fn installed_family(fonts: &fontdb::Database, known: &[&str], monospaced: bool) 
 
 /// Render the map as an SVG document
 pub fn render_svg(map: &StoryMap, options: &ImageOptions) -> String {
-    let contents = CardContent::measure_all(map, options);
+    render_svg_with(map, options, &usvg_options(&options.fonts))
+}
+
+fn render_svg_with(map: &StoryMap, options: &ImageOptions, usvg_options: &usvg::Options) -> String {
+    let contents = CardContent::measure_all(map, options, usvg_options);
     let level_titles: Vec<TextSpec> = map
         .level_titles
         .iter()
         .map(|title| TextSpec::markdown("", title, FONT_SIZE))
         .collect();
-    let level_title_widths = measure(&level_titles, options);
+    let level_title_widths = measure(&level_titles, usvg_options);
     // The blocks are stacked from the top, like the HTML page: the title, the notes above, the grid, and the notes below
     let mut flow = Flow::new(PAGE_PADDING);
     let mut texts = Vec::new();
@@ -158,7 +162,7 @@ pub fn render_svg(map: &StoryMap, options: &ImageOptions) -> String {
         texts.push((TextSpec::markdown("", note, FONT_SIZE), top + BASELINE));
     }
     let specs: Vec<TextSpec> = texts.iter().map(|(spec, _)| spec.clone()).collect();
-    let content_width = measure(&specs, options)
+    let content_width = measure(&specs, usvg_options)
         .into_iter()
         .fold(grid.width, f32::max);
     let width = 2.0 * PAGE_PADDING + content_width;
@@ -191,11 +195,9 @@ pub fn render_png(map: &StoryMap, options: &ImageOptions) -> Vec<u8> {
         options.scale.is_finite() && options.scale > 0.0,
         "the scale must be a positive finite number"
     );
-    let usvg_options = usvg::Options {
-        fontdb: options.fonts.clone(),
-        ..usvg::Options::default()
-    };
-    let tree = usvg::Tree::from_str(&render_svg(map, options), &usvg_options)
+    // The fonts that measured the text also draw it, so the fallback fonts found while measuring are reused
+    let usvg_options = usvg_options(&options.fonts);
+    let tree = usvg::Tree::from_str(&render_svg_with(map, options, &usvg_options), &usvg_options)
         .expect("the rendered svg is well formed");
     // Round up after scaling. Rounding first would add up to one pixel per scale step
     let width = (tree.size().width() * options.scale).ceil() as u32;
@@ -233,7 +235,11 @@ struct CardContent {
 }
 
 impl CardContent {
-    fn measure_all(map: &StoryMap, options: &ImageOptions) -> Vec<Self> {
+    fn measure_all(
+        map: &StoryMap,
+        options: &ImageOptions,
+        usvg_options: &usvg::Options,
+    ) -> Vec<Self> {
         let line_width = options.max_card_width - 2.0 * (CARD_PADDING_X + CARD_BORDER);
         // The text of each card with its checkbox as an emoji, cut where a line may break
         let pieces = map
@@ -252,12 +258,12 @@ impl CardContent {
         let mut tags = tags
             .iter()
             .cloned()
-            .zip(measure(&tags, options))
+            .zip(measure(&tags, usvg_options))
             .collect::<Vec<_>>()
             .into_iter();
         map.cells
             .iter()
-            .zip(wrap_all(pieces, line_width, options))
+            .zip(wrap_all(pieces, line_width, usvg_options))
             .map(|(cell, mut lines)| {
                 place_tags(
                     &mut lines,
@@ -293,7 +299,11 @@ impl CardContent {
 // A line is measured as a whole, not piece by piece. usvg draws a text that has a Japanese character
 // all in the fallback font, so the width of a piece depends on the rest of the line.
 // Each measurement is slow, so all cards are wrapped together and each step measures one text of every card
-fn wrap_all(cards: Vec<Vec<TextSpec>>, line_width: f32, options: &ImageOptions) -> Vec<Vec<Line>> {
+fn wrap_all(
+    cards: Vec<Vec<TextSpec>>,
+    line_width: f32,
+    usvg_options: &usvg::Options,
+) -> Vec<Vec<Line>> {
     let mut wrappings: Vec<Wrapping> = cards
         .into_iter()
         .map(|pieces| Wrapping {
@@ -313,7 +323,7 @@ fn wrap_all(cards: Vec<Vec<TextSpec>>, line_width: f32, options: &ImageOptions) 
         if texts.is_empty() {
             break;
         }
-        for (index, width) in indexes.into_iter().zip(measure(&texts, options)) {
+        for (index, width) in indexes.into_iter().zip(measure(&texts, usvg_options)) {
             wrappings[index].take_width(width);
         }
     }
